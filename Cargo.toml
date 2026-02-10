@@ -2,6 +2,9 @@
 name = "entropy-pool"
 version = "0.0.1"
 edition = "2024"
+authors = ["Yingqi Z_1501609820@163.com"]
+description = "A simple entropy pool"
+license = "AGPL-3.0-only"
 
 [dependencies]
 rand = "0.9.2"
