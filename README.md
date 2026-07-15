@@ -36,7 +36,7 @@ random byte.
 ### `EntropyPool::with_rng(rng)`
 
 Creates a new pool backed by a caller-provided RNG implementing
-`rand::RngCore`. This is useful for deterministic tests, seeded generators, or
+`rand::Rng`. This is useful for deterministic tests, seeded generators, or
 specialized randomness sources.
 
 ### `gen_range(n: u32) -> u32`
@@ -62,8 +62,10 @@ instead.
 
 Returns `m` distinct values from `0..n` as a sorted set.
 
-For large selections, the implementation samples the smaller side and returns
-the complement, so `combination(90, 100)` only has to sample 10 excluded values.
+The implementation uses Floyd's sampling algorithm with online rank recycling.
+It performs `min(m, n - m)` bounded draws and keeps only the sampled set, using
+`O(min(m, n - m))` auxiliary space. For large selections it samples the
+smaller excluded set and returns the complement.
 
 Panics if `m > n`.
 
@@ -303,118 +305,102 @@ fallback can lose retained entropy, but it cannot bias future outputs.
 
 ### Correctness of `combination`
 
-A combination has less entropy than an ordered sample. For example, choosing
-two items from four has:
-
-```text
-C(4, 2) = 6 combinations
-P(4, 2) = 12 ordered samples
-```
-
-The implementation samples through a shuffle-like process, but after each item
-is inserted into an order-statistics tree it recycles the item's rank among the
-already-selected items. That rank is exactly the ordering information that a
-combination does not need.
-
-So the final set remains uniformly distributed, while the discarded ordering
-entropy is returned to the pool for later draws.
-
-For the proof, let `k` be the number of items actually sampled by the
-implementation:
+Let `k` be the number of items actually sampled:
 
 ```text
 k = min(m, n - m).
 ```
 
-First ignore the complement optimization and consider sampling `k` selected
-items. The loop chooses an ordered sequence:
+The implementation applies Floyd's transition. Starting with the empty set
+`S`, for:
 
 ```text
-T = (T1, T2, ..., Tk)
+j = n-k, n-k+1, ..., n-1
 ```
 
-without replacement from `[n]`. By the same argument as `permutation`, `T` is
-uniform over the `P(n, k)` ordered distinct sequences. Repeated application of
-the `gen_range` proof also gives that the pool state remaining after these
-draws is independent of `T`.
-
-Let:
+it draws `T` uniformly from `[j+1]` and updates:
 
 ```text
-S_j = {T1, T2, ..., Tj}.
+if T is in S:  S' = S union {j}
+otherwise:    S' = S union {T}
 ```
 
-After inserting `Tj`, the implementation computes:
+In both branches `T` belongs to `S'`. If the new set has size `r`, the
+implementation recycles:
 
 ```text
-R_j = rank of Tj inside S_j,
+D = rank of T inside S',    D in [r].
 ```
 
-so `R_j` is an integer in `[j]`.
+The important detail is that a collision inserts `j`, but the recycled digit is
+the rank of the original draw `T`, not the rank of `j`.
 
-Now consider the map:
+We prove the following invariant after round `r`: `S'` is uniform over the
+`r`-subsets of `[j+1]`, and the entropy-pool state is uniform and independent
+of `S'`.
+
+Before round `r`, assume `S` is a uniform `(r-1)`-subset of `[j]`. The pool is
+independent of `S`, and `gen_range(j+1)` returns a uniform `T` while leaving a
+pool state independent of `(S, T)`. Consider the transition:
 
 ```text
-T -> (S_k, R_1, R_2, ..., R_k).
+(S, T) -> (S', D).
 ```
 
-This map is a bijection.
-
-To see injectivity, reconstruct `T` backwards. Given the final set `S_k` and
-the ranks `R_1..R_k`, `T_k` is the `R_k`-th smallest element of `S_k`. Remove
-it to recover `S_{k-1}`. Then `T_{k-1}` is the `R_{k-1}`-th smallest element of
-`S_{k-1}`. Continue until `T_1` is recovered. Hence no two ordered sequences
-produce the same `(S_k, R_1, ..., R_k)`.
-
-The codomain has size:
+It has the following explicit inverse. Given an `r`-subset `S'` of `[j+1]` and
+`D in [r]`, let `T` be the `D`-th smallest element of `S'`, then set:
 
 ```text
-C(n, k) * 1 * 2 * ... * k
-= C(n, k) * k!
-= P(n, k),
+if j is in S':  S = S' without j
+otherwise:      S = S' without T
 ```
 
-which equals the number of possible ordered sequences. Therefore the injective
-map is bijective.
-
-Since `T` is uniform and the bijection factors it into:
+If `j` is absent, `T` was not in `S` and the non-collision branch inserted it.
+If `j` is present, removing `j` reconstructs the old set: either `T = j` was
+inserted directly, or `T` was already present and caused the collision. Thus
+the inverse is valid and unique in every case, so the transition is a
+bijection. Equivalently:
 
 ```text
-S_k in the C(n, k) possible sets
-(R_1, ..., R_k) in [1] x [2] x ... x [k],
+C(j, r-1) * (j+1) = C(j+1, r) * r.
 ```
 
-the set `S_k` is uniform over all `k`-subsets, and the rank tuple is uniform
-and independent of `S_k`.
-
-After each insertion, the implementation calls:
+Because `(S, T)` is uniform over the left-hand side, `(S', D)` is uniform over
+the Cartesian product on the right. Consequently `S'` is uniform, `D` is
+uniform on `[r]`, and they are independent. The residual pool was already
+independent of `(S', D)`, so:
 
 ```text
-recycle(R_j, j)
+recycle(D, r)
 ```
 
-The rank tuple is exactly the ordering information that distinguishes an
-ordered sample from its unordered set. Because the tuple is independent of the
-final set, each recycled rank digit preserves the pool invariant conditioned on
-the returned combination. If all recycle multiplications fit, after all `k`
-steps the pool has recovered:
+preserves a uniform pool independent of `S'`. This completes the induction.
+There is no hidden candidate ordering in Floyd's algorithm: the complete state
+that affects the next round is the set `S'` covered by the invariant. This is
+essential. A Fisher-Yates candidate array can be correlated with a recycled
+rank even when the final rank tuple is independent of the final set, so the
+global ordered-sample bijection alone is not sufficient for online recycling.
+
+The recycle multiplication in this loop cannot overflow. If the working radix
+immediately before the successful `gen_range(j+1)` split is `M_work`, the
+residual radix is `floor(M_work / (j+1))`. Multiplying it by `r <= j+1` cannot
+exceed `M_work <= u64::MAX`.
+
+Across all `k` rounds:
 
 ```text
-log2(1 * 2 * ... * k) = log2(k!)
+product of draw radices     = (n-k+1) * ... * n = P(n, k)
+product of recycled radices = 1 * 2 * ... * k   = k!
 ```
 
-bits of state space, up to integer radix representation. If a recycle overflow
-fallback occurs, correctness is unchanged, but some previously retained entropy
-is deliberately discarded.
-
-Therefore `combination(k, n)` returns a uniform `k`-subset and recycles the
-discarded order entropy.
+Since `P(n, k) = C(n, k) * k!`, the returned set accounts for exactly
+`log2 C(n, k)` bits and the recycled ranks account for exactly `log2(k!)` bits.
 
 When the requested `m` is larger than `n / 2`, the implementation samples the
 excluded set of size `n - m` and returns its complement. The complement map is a
 bijection between `(n - m)`-subsets and `m`-subsets, so uniformity is preserved.
-The recycled rank tuple is independent of the excluded set, and therefore also
-independent of its complement.
+The pool is independent of the excluded set and therefore also independent of
+its complement.
 
 ### Entropy lower bound
 
@@ -464,6 +450,9 @@ The tests include:
 - exhaustive uniformity for `permutation(2, 3)`;
 - exhaustive uniformity for `combination(2, 4)`;
 - verification that `combination(2, 4)` recycles the discarded order bit;
+- the `combination(3, 6)` regression that detects feedback from a hidden
+  candidate ordering;
+- exhaustive output/pool independence for every combination with `n <= 8`;
 - edge cases for empty, full, direct, and complement combinations;
 - a large entropy-utilization check against the binomial lower bound.
 
@@ -483,13 +472,14 @@ When retained pool entropy is included, the accounting should be very close to
 ## Notes
 
 - The default pool uses `ThreadRng`, but `EntropyPool::with_rng` accepts any
-  `rand::RngCore`.
+  `rand::Rng`.
 - Public sampling APIs use `u32` ranges and the internal pool state is `u64`.
   This keeps the hot path on native-width arithmetic. If expansion or recycling
   cannot keep older retained entropy inside `u64`, the implementation keeps
   correctness by discarding that older retained entropy.
-- `permutation` and `combination` currently build a `Vec<u32>` for the whole
-  population, so memory use is `O(n)`.
+- `permutation` builds a `Vec<u32>` for the whole population. `combination`
+  keeps an order-statistics set of size `min(m, n - m)` and therefore uses
+  `O(min(m, n - m))` auxiliary space, excluding the returned set.
 - The non-`try_*` methods are convenience wrappers that panic on invalid
   arguments. Use the checked methods for library-facing error handling.
 

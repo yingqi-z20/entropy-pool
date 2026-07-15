@@ -22,7 +22,7 @@
 //! assert_eq!(combination.len(), 5);
 //! ```
 
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
@@ -87,7 +87,7 @@ impl Default for EntropyPool<rand::rngs::ThreadRng> {
     }
 }
 
-impl<R: RngCore> EntropyPool<R> {
+impl<R: Rng> EntropyPool<R> {
     /// Creates a new pool backed by `rng`.
     ///
     /// The pool reads one random byte immediately so that its initial state is
@@ -210,26 +210,40 @@ impl<R: RngCore> EntropyPool<R> {
             return Ok(BTreeSet::from_iter(0..n));
         }
 
-        let rev = m > n - m;
-        let m = if rev { n - m } else { m };
-        let mut s = OSBTreeSet::new();
-        let mut c = population_vec(n)?;
+        let complement = m > n - m;
+        let sample_size = if complement { n - m } else { m };
+        let start = n - sample_size;
+        let mut selected = OSBTreeSet::new();
 
-        for i in (n - m..n).rev() {
-            let r = self.try_gen_range(i + 1)?;
-            let t = c[r as usize];
-            c.swap(r as usize, i as usize);
-            s.insert(t);
+        // Floyd's transition keeps no candidate ordering hidden from the
+        // returned set. This makes the recycled rank safe for the next round.
+        for j in start..n {
+            let t = self.try_gen_range(j + 1)?;
+            if !selected.insert(t) {
+                let inserted = selected.insert(j);
+                debug_assert!(inserted, "Floyd replacement should be new");
+            }
 
-            let b = s.rank_of(&t).expect("inserted value should have a rank") as u32;
-            self.recycle(b, n - i);
+            let rank = selected
+                .rank_of(&t)
+                .expect("the sampled value should remain in the set") as u32;
+            let radix = j - start + 1;
+            self.recycle(rank, radix);
         }
 
-        if !rev {
-            Ok(BTreeSet::from_iter(s))
+        if !complement {
+            Ok(BTreeSet::from_iter(selected))
         } else {
-            c.truncate((n - m) as usize);
-            Ok(BTreeSet::from_iter(c))
+            let mut excluded = selected.into_iter().peekable();
+            let mut result = BTreeSet::new();
+            for value in 0..n {
+                if excluded.peek() == Some(&value) {
+                    excluded.next();
+                } else {
+                    result.insert(value);
+                }
+            }
+            Ok(result)
         }
     }
 
@@ -303,6 +317,7 @@ fn population_vec(n: u32) -> Result<Vec<u32>, EntropyPoolError> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::convert::Infallible;
 
     #[derive(Clone)]
     struct ByteRng {
@@ -321,23 +336,26 @@ mod tests {
         }
     }
 
-    impl RngCore for ByteRng {
-        fn next_u32(&mut self) -> u32 {
+    impl rand::TryRng for ByteRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
             let mut bytes = [0; 4];
-            self.fill_bytes(&mut bytes);
-            u32::from_le_bytes(bytes)
+            self.try_fill_bytes(&mut bytes)?;
+            Ok(u32::from_le_bytes(bytes))
         }
 
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
             let mut bytes = [0; 8];
-            self.fill_bytes(&mut bytes);
-            u64::from_le_bytes(bytes)
+            self.try_fill_bytes(&mut bytes)?;
+            Ok(u64::from_le_bytes(bytes))
         }
 
-        fn fill_bytes(&mut self, dst: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
             for byte in dst {
                 *byte = self.next_byte();
             }
+            Ok(())
         }
     }
 
@@ -355,6 +373,14 @@ mod tests {
         (1..=k)
             .map(|i| ((n - k + i) as f64).log2() - (i as f64).log2())
             .sum()
+    }
+
+    fn factorial(n: u32) -> u64 {
+        (1..=u64::from(n)).product()
+    }
+
+    fn exact_choose(n: u32, k: u32) -> u64 {
+        factorial(n) / (factorial(k) * factorial(n - k))
     }
 
     #[test]
@@ -471,6 +497,85 @@ mod tests {
                 vec![0, 1],
                 "combination {combination:?} should appear once per recycled order state"
             );
+        }
+    }
+
+    #[test]
+    fn combination_3_of_6_is_uniform_and_pool_independent() {
+        let mut observations = BTreeMap::new();
+
+        for seed in 0..120 {
+            let mut ep = pool_with_state(seed, 120);
+            let combination = Vec::from_iter(ep.combination(3, 6));
+
+            assert_eq!(
+                ep.random_bytes_read(),
+                0,
+                "seed {seed} should not need extra bytes"
+            );
+            assert_eq!(
+                ep.retained_states(),
+                6,
+                "seed {seed} should retain all six ordering states"
+            );
+            observations
+                .entry(combination)
+                .or_insert_with(Vec::new)
+                .push(ep.b);
+        }
+
+        assert_eq!(observations.len(), 20);
+        for (combination, mut residuals) in observations {
+            residuals.sort_unstable();
+            assert_eq!(
+                residuals,
+                Vec::from_iter(0..6),
+                "combination {combination:?} should be independent of the residual pool"
+            );
+        }
+    }
+
+    #[test]
+    fn all_combinations_up_to_8_form_an_exact_output_pool_product() {
+        for n in 0..=8 {
+            let input_states = factorial(n);
+
+            for m in 0..=n {
+                let expected_outputs = exact_choose(n, m);
+                let expected_residual_states = factorial(m) * factorial(n - m);
+                let mut output_counts = BTreeMap::new();
+                let mut output_pool_pairs = BTreeSet::new();
+
+                for seed in 0..input_states {
+                    let mut ep = pool_with_state(seed, input_states);
+                    let combination = Vec::from_iter(ep.combination(m, n));
+
+                    assert_eq!(
+                        ep.random_bytes_read(),
+                        0,
+                        "combination({m}, {n}), seed {seed} unexpectedly read random bytes"
+                    );
+                    assert_eq!(
+                        ep.retained_states(),
+                        expected_residual_states,
+                        "combination({m}, {n}), seed {seed} retained the wrong state count"
+                    );
+                    assert!(
+                        output_pool_pairs.insert((combination.clone(), ep.b)),
+                        "combination({m}, {n}), seed {seed} duplicated an output-pool pair"
+                    );
+                    *output_counts.entry(combination).or_insert(0_u64) += 1;
+                }
+
+                assert_eq!(output_counts.len() as u64, expected_outputs);
+                assert!(
+                    output_counts
+                        .values()
+                        .all(|&count| count == expected_residual_states),
+                    "combination({m}, {n}) was not exactly uniform: {output_counts:#?}"
+                );
+                assert_eq!(output_pool_pairs.len() as u64, input_states);
+            }
         }
     }
 
