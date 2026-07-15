@@ -1,10 +1,12 @@
 [package]
 name = "entropy-pool"
-version = "0.0.1"
+version = "1.0.0"
 edition = "2024"
 authors = ["Yingqi Z_1501609820@163.com"]
 description = "A simple entropy pool"
 license = "AGPL-3.0-only"
+repository = "https://github.com/yingqi-z20/entropy-pool"
+documentation = "https://docs.rs/entropy-pool"
 
 [dependencies]
 rand = "0.10.1"
